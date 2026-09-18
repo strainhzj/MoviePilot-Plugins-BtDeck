@@ -27,7 +27,7 @@ from .btdeck_client import BtDeckApiError, BtDeckClient
 from .moviepilot_adapter import MoviePilotAdapterError, MoviePilotV2Adapter
 from .sync import SyncEngine
 
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.0.1"
 PROTOCOL_VERSION = 1
 
 
@@ -48,6 +48,9 @@ class BtDeckBridge(_PluginBase):
     KEY_INTERVAL = "sync_interval_minutes"
     KEY_FULL_HOURS = "full_rescan_hours"
     KEY_BATCH = "batch_size"
+
+    DEFAULT_INTERVAL_MINUTES = 30
+    MIN_INTERVAL_MINUTES = 5
 
     def __init__(self):
         super().__init__()
@@ -77,17 +80,25 @@ class BtDeckBridge(_PluginBase):
     # ------------------------------------------------------------ 周期与手动入口
 
     def get_service(self) -> List[Dict[str, Any]]:
-        """注册周期同步任务（BackgroundScheduler 线程池执行，同步函数）。"""
+        """注册周期同步任务（BackgroundScheduler 线程池执行，同步函数）。
+
+        宿主调度器只展开 service["kwargs"] 作为触发器参数（V2/V3 的
+        SchedulerChain/JobScheduler 均为 ``**(service.get("kwargs") or {})``），
+        定时间隔必须放在 kwargs 内；顶层多余键会被静默忽略（interval 触发器
+        空参数会被 APScheduler 钳制为每秒执行）。
+        """
         if not self.get_state():
             return []
-        interval = self._positive_int(self.KEY_INTERVAL, default=30, minimum=5)
+        interval = self._resolve_interval_minutes()
+        if interval is None:
+            return []
         return [
             {
                 "id": "BtDeckBridgeSync",
                 "name": "BtDeck 整理历史同步",
                 "trigger": "interval",
                 "func": self.sync_job,
-                "minutes": interval,
+                "kwargs": {"minutes": interval},
             }
         ]
 
@@ -164,6 +175,9 @@ class BtDeckBridge(_PluginBase):
     def _status_payload(summary) -> Dict[str, Any]:
         payload = summary.to_dict()
         payload["ok"] = bool(summary.finished)
+        if not summary.finished:
+            # 未整趟完成（含部分记录推送失败）：向调用者如实报告原因
+            payload["message"] = summary.stopped_reason or "本趟同步未完成（断点已保留，下次重试）"
         return payload
 
     # ------------------------------------------------------------ 宿主装配
@@ -179,12 +193,30 @@ class BtDeckBridge(_PluginBase):
         return MoviePilotV2Adapter(base_url=f"http://127.0.0.1:{port}", api_token=str(api_token or ""))
 
     def _moviepilot_version(self) -> str:
+        """读取宿主版本号，供握手上报与 BtDeck 侧兼容判断。
+
+        宿主（V2/V3）的完整版本只存在于进程根目录 ``version.py`` 的
+        ``APP_VERSION``（宿主自身 ``app.core.config`` 即从此导入）；
+        ``settings`` 上没有 ``VERSION`` 属性，只有 ``VERSION_FLAG``
+        （"v2"/"v3"）可作为退化来源。读取失败返回空串，不阻断同步。
+        """
+        try:
+            from version import APP_VERSION
+
+            app_version = str(APP_VERSION or "").strip()
+            if app_version:
+                return app_version
+        except ImportError:
+            pass
         try:
             from app.core.config import settings
 
-            return str(getattr(settings, "VERSION", "") or "")
-        except ImportError:  # pragma: no cover
-            return ""
+            flag = str(getattr(settings, "VERSION_FLAG", "") or "").strip()
+            if flag:
+                return flag
+        except ImportError:  # pragma: no cover - 宿主外运行（单测桩）
+            pass
+        return ""
 
     def _instance_id(self) -> str:
         """实例 UUID：首次生成并持久化（BtDeck 侧幂等身份）。"""
@@ -207,6 +239,24 @@ class BtDeckBridge(_PluginBase):
         except (TypeError, ValueError):
             value = default
         return max(minimum, value)
+
+    def _resolve_interval_minutes(self) -> Optional[int]:
+        """解析同步周期（分钟）：0 = 关闭周期任务（返回 None，手动同步不受影响）。
+
+        空值/非法值/负数回退默认值；正数按约定的最小间隔（5 分钟）钳制。
+        """
+        raw = self._config.get(self.KEY_INTERVAL)
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return self.DEFAULT_INTERVAL_MINUTES
+        try:
+            value = int(str(raw).strip())
+        except ValueError:
+            return self.DEFAULT_INTERVAL_MINUTES
+        if value == 0:
+            return None
+        if value < 0:
+            return self.DEFAULT_INTERVAL_MINUTES
+        return max(self.MIN_INTERVAL_MINUTES, value)
 
     def _log(self, message: str) -> None:
         """宿主日志（令牌等敏感信息在底层模块已脱敏，这里只透传文案）。"""

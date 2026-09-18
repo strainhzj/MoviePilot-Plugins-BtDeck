@@ -3,13 +3,14 @@
     "name": "BtDeckBridge",
     "description": "将 MoviePilot 整理历史只读同步到 BtDeck，建立媒体库文件、整理源文件与 BT 任务的关联；支持增量水位、周期全量重扫与断点续跑。",
     "labels": "btdeck,integration,organize",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/link.png",
     "author": "BtDeck",
     "author_url": "https://github.com/strainhzj/BtDeck",
-    "system_version": ">=2.0.0",
+    "system_version": ">=2.0.0,<3",
     "level": 1,
     "history": {
+      "v1.0.1": "修复：定时服务间隔改放入宿主实际消费的 kwargs（此前空触发参数会退化为每秒执行）；同步间隔 0 正式关闭周期任务（手动同步不受影响）；批次部分失败不再推进水位并保留整页重试断点；增量提前收口改读宿主真实字段 id 并加固同秒排序安全条件；宿主版本改读 version.APP_VERSION（settings 无 VERSION 属性）；依赖声明移入插件目录（宿主安装器只发现 plugins.v2/<插件>/requirements.txt）；支持范围明确限定 V2（V3 机制源码核验一致但未运行验证）。",
       "v1.0.0": "首版：整理历史只读镜像同步（实例身份/水位+全量重扫+断点续跑）、MoviePilot→BtDeck 下载器映射、媒体库关联查询（种子详情页签+路径反查）。需 BtDeck 设置中开启 MoviePilot 集成开关并创建专用集成账号。"
     }
   }

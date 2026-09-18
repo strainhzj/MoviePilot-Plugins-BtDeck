@@ -1,1 +1,6 @@
+# 仓库开发/测试环境依赖（宿主安装器不读取此文件；
+# 插件运行依赖见 plugins.v2/btdeckbridge/requirements.txt）
 httpx>=0.24.0
+pytest>=7.0
+# 调度契约测试需实例化与宿主一致的 APScheduler 3.x IntervalTrigger
+APScheduler>=3.10,<4

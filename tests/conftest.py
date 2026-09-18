@@ -47,9 +47,23 @@ class _StubPluginBase:
 
 
 class _StubSettings:
+    """宿主 settings 桩：只镜像经 V2/V3 源码核验真实存在的属性。
+
+    真实宿主的 settings **没有** ``VERSION`` 属性（V2/V3 均只有
+    ``VERSION_FLAG``，如 "v2"/"v3"）；完整版本号在宿主进程根目录
+    ``version.py`` 的 ``APP_VERSION``（app.core.config 即 `from version
+    import APP_VERSION`）。桩结构必须与之一致，避免虚构属性"证明"兼容。
+    """
+
     PORT = 3001
     API_TOKEN = "mp-stub-token"
-    VERSION = "2.9.9-stub"
+    VERSION_FLAG = "v2"
+
+
+class _StubHostVersionModule(types.ModuleType):
+    """模拟宿主根目录 version.py（宿主进程从 ROOT_PATH 导入顶层 version 模块）。"""
+
+    APP_VERSION = "v2.15.6"
 
 
 class _StubLogger:
@@ -84,6 +98,8 @@ def _install_host_stubs():
     sys.modules.setdefault("app.core", core_mod)
     sys.modules.setdefault("app.core.config", config_mod)
     sys.modules.setdefault("app.log", log_mod)
+    # 确定性安装 version 桩：个别环境若装有同名顶层模块会导致断言不稳定
+    sys.modules["version"] = _StubHostVersionModule("version")
 
 
 _install_host_stubs()

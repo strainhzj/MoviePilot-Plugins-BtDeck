@@ -4,14 +4,20 @@
 同步策略（对应需求"不仅依赖最大历史 ID 判断增量"）：
 
 - **增量（incremental）**：宿主列表按 date 倒序，从第 1 页向旧游走，
-  收集 ``historyId > watermark`` 的条目分批推送；遇到整页均 ≤ watermark
-  即提前收口——新整理的记录总会出现在最前面的页里；
+  收集 ``historyId > watermark`` 的条目分批推送；遇到"整页均 ≤ watermark
+  且页内至少跨两个不同时间戳"才提前收口——新整理的记录总会出现在最前面
+  的页里；整页同秒（date 相同）或存在缺失 date 时同秒顺序不稳定，继续
+  游走防漏同步（时钟回拨造成的乱序由周期全量重扫兜底）；
 - **全量（full）**：从头游走全部页（服务端按 (instance, historyId) 幂等
   去重，重复推送只会计入 skipped），用于首次同步、手动重扫与周期补偿
   （捕获重新整理/历史字段更新——这类更新不改变 id，增量游走发现不了）；
 - **水位纪律**：``watermark`` 只在一趟完整走完后用本趟 ``max_seen`` 推进；
-  中途失败/停止保留 ``pass`` 断点（下一页页码），下次从断点页续跑，
-  已推批次靠服务端幂等去重，不会重复入库；
+  中途失败/停止/部分失败均保留 ``pass`` 断点，下次从断点页续跑，已推批次
+  靠服务端幂等去重，不会重复入库；
+- **部分失败**：服务端单批返回 ``failed > 0``（逐条校验失败等）时本趟
+  立即收口：不推进水位、断点留在失败页（其后各页下次重走，幂等无损）、
+  结果如实上报 failed 数与原因；下次同步重试整页，已成功条目由服务端
+  幂等吸收为 skipped；
 - **重试**：单批网络/服务错误指数退避重试（默认 3 次），仍失败则中止本趟
   并保留断点；停止信号（插件停用/重载）在页与批之间检查，立即中止。
 
@@ -164,13 +170,20 @@ class SyncEngine:
         max_seen = int(page_state.get("max_seen", watermark) or watermark)
 
         pending: List[Dict[str, Any]] = []
+        # 部分失败策略：服务端确认 failed>0 的页，本趟立即收口并把断点留在
+        # 该页（服务端按 (instance, historyId) 幂等去重，重推已成功条目只计
+        # skipped，不产生重复）。不继续游走后续页：否则循环内的中间断点保存
+        # 只记录 next_page+1，一旦后续读取异常提前退出，失败页信息就会丢失。
+        first_partial_failed_page: Optional[int] = None
 
         def flush(is_last_batch: bool) -> None:
-            nonlocal pending
+            nonlocal pending, first_partial_failed_page
             for start in range(0, len(pending), self.batch_size):
                 chunk = pending[start : start + self.batch_size]
                 last = is_last_batch and start + self.batch_size >= len(pending)
-                self._push_batch(instance_id, mode, next_page, len(chunk), last, chunk, summary)
+                batch_clean = self._push_batch(instance_id, mode, next_page, len(chunk), last, chunk, summary)
+                if not batch_clean and first_partial_failed_page is None:
+                    first_partial_failed_page = next_page
             pending = []
 
         while next_page <= self.MAX_PAGES_HARD_LIMIT:
@@ -194,14 +207,23 @@ class SyncEngine:
 
             last_page = next_page * self.batch_size >= total
             if mode == "incremental":
-                ids = [item.get("historyId") for item in raw_items]
+                # 宿主原始记录的主键字段是 id（TransferHistory.to_dict 按列名输出）
+                ids = [raw.get("id") for raw in raw_items]
                 all_below_watermark = all(isinstance(i, int) and i <= watermark for i in ids)
-                if all_below_watermark and not pending:
+                # 宿主按 date 倒序分页且同秒记录间顺序不稳定：整页同一时间戳或
+                # 存在缺失 date 时，高于水位的记录仍可能落在后续页——继续游走，
+                # 宁多读一页也不漏同步（时钟回拨导致的乱序由周期全量重扫兜底）
+                page_dates = {raw.get("date") for raw in raw_items}
+                ordering_safe = None not in page_dates and len(page_dates) >= 2
+                if all_below_watermark and not pending and ordering_safe:
                     break
 
             # 每走完一页就落断点（页级续跑粒度；批内失败不推进页码）
             flush(last_page)
             if summary.stopped_reason:
+                break
+            if first_partial_failed_page is not None:
+                # 本页部分失败：立即收口，断点留在本页（统一走末尾的收口逻辑）
                 break
             page_state = {"mode": mode, "next_page": next_page + 1, "max_seen": max_seen}
             checkpoint["pass"] = page_state
@@ -210,7 +232,7 @@ class SyncEngine:
                 break
             next_page += 1
 
-        finished = not summary.stopped_reason
+        finished = not summary.stopped_reason and first_partial_failed_page is None
         if finished:
             # 整趟完成：推进水位并清除断点；全量重扫刷新 last_full_at
             checkpoint["watermark"] = max(int(checkpoint.get("watermark", 0) or 0), max_seen)
@@ -220,7 +242,14 @@ class SyncEngine:
             summary.finished = True
             summary.watermark = int(checkpoint["watermark"])
         else:
-            page_state = {"mode": mode, "next_page": next_page, "max_seen": max_seen}
+            if first_partial_failed_page is not None and not summary.stopped_reason:
+                summary.stopped_reason = (
+                    f"部分记录推送失败（failed={summary.failed}），"
+                    f"断点保留在第 {first_partial_failed_page} 页，下次同步重试整页"
+                )
+            # 未整趟完成不推进水位：跨过失败记录推进会导致其永久漏同步
+            resume_page = first_partial_failed_page if first_partial_failed_page is not None else next_page
+            page_state = {"mode": mode, "next_page": resume_page, "max_seen": max_seen}
             checkpoint["pass"] = page_state
         self._save_checkpoint(checkpoint)
         self.log(
@@ -238,14 +267,15 @@ class SyncEngine:
         is_last_batch: bool,
         items: List[Dict[str, Any]],
         summary: SyncSummary,
-    ) -> None:
+    ) -> bool:
+        """推送一批，返回本批是否全部成功（failed==0 且未被中止/重试耗尽）。"""
         if not items:
-            return
+            return True
         last_error: Optional[BtDeckApiError] = None
         for attempt in range(self.MAX_RETRIES):
             if self.stop_event.is_set():
                 summary.stopped_reason = "插件停用，本趟中止（断点已保留）"
-                return
+                return False
             try:
                 result = self.client.sync_transfer_history(
                     instance_id=instance_id,
@@ -259,23 +289,29 @@ class SyncEngine:
                 summary.inserted += int(result.get("inserted", 0) or 0)
                 summary.updated += int(result.get("updated", 0) or 0)
                 summary.skipped += int(result.get("skipped", 0) or 0)
-                summary.failed += int(result.get("failed", 0) or 0)
+                failed = int(result.get("failed", 0) or 0)
+                summary.failed += failed
                 for entry in result.get("errors", []) or []:
                     if isinstance(entry, dict):
                         summary.errors.append(f"historyId={entry.get('historyId')}: {entry.get('error')}")
-                return
+                if failed > 0:
+                    # 服务端确认的单条失败：本批不算干净，调用方保留整页重试断点
+                    self.log(f"第 {page_number} 页有 {failed} 条记录推送失败，本趟将保留断点重试整页")
+                    return False
+                return True
             except BtDeckApiError as exc:
                 last_error = exc
                 if exc.http_status in (400, 401, 403, 404, 409, 422):
                     # 不可重试类错误：重试无意义，直接中止本趟
                     summary.stopped_reason = f"推送被拒绝（HTTP {exc.http_status}）：{exc.message}"
                     summary.errors.append(summary.stopped_reason)
-                    return
+                    return False
                 self.log(f"推送失败（第 {attempt + 1} 次）：{exc.message}，退避后重试")
                 self._sleep(self.RETRY_BACKOFF_SECONDS * (2**attempt))
         if last_error is not None:
             summary.stopped_reason = f"推送连续失败：{last_error.message}"
             summary.errors.append(summary.stopped_reason)
+        return False
 
     # ------------------------------------------------------------ 断点
 
